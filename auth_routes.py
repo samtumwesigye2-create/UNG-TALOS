@@ -57,6 +57,15 @@ def _clear_rate_limit(conn, email: str):
     conn.commit()
 
 
+def _password_authenticated_user(conn, email: str, password: str):
+    _check_rate_limit(conn, email)
+    row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if row is None or not verify_password(password, row["password_hash"], row["salt"]):
+        _record_failed_login(conn, email)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return row
+
+
 class LoginIn(BaseModel):
     email: str
     password: str
@@ -68,15 +77,11 @@ class LoginIn(BaseModel):
 def login(body: LoginIn):
     conn = get_db()
     try:
-        _check_rate_limit(conn, body.email)
-        row = conn.execute("SELECT * FROM users WHERE email=?", (body.email,)).fetchone()
-        if row is None or not verify_password(body.password, row["password_hash"], row["salt"]):
-            _record_failed_login(conn, body.email)
-            raise HTTPException(status_code=401, detail="Invalid email or password")
+        row = _password_authenticated_user(conn, body.email, body.password)
 
         if row["role"] in MFA_REQUIRED_ROLES:
             if not row["mfa_enabled"]:
-                raise HTTPException(status_code=403, detail="MFA setup required for this role before login — call /auth/mfa/setup first")
+                raise HTTPException(status_code=403, detail="MFA setup required for this role before login — call /auth/mfa/bootstrap/setup first")
             mfa_ok = bool(body.totp_code and verify_totp(row["mfa_secret"], body.totp_code))
             if not mfa_ok and body.backup_code:
                 mfa_ok = consume_backup_code(conn, row["id"], body.backup_code)
@@ -87,6 +92,60 @@ def login(body: LoginIn):
         _clear_rate_limit(conn, body.email)
         token = issue_token(row)
         return {"access_token": token, "token_type": "bearer", "role": row["role"]}
+    finally:
+        conn.close()
+
+
+class BootstrapMfaSetupIn(BaseModel):
+    email: str
+    password: str
+
+
+@router.post("/mfa/bootstrap/setup")
+def bootstrap_mfa_setup(body: BootstrapMfaSetupIn):
+    conn = get_db()
+    try:
+        row = _password_authenticated_user(conn, body.email, body.password)
+        if row["role"] not in MFA_REQUIRED_ROLES:
+            raise HTTPException(status_code=400, detail="Bootstrap MFA setup is only for roles that require MFA")
+        if row["mfa_enabled"]:
+            raise HTTPException(status_code=409, detail="MFA is already enabled; use the authenticated MFA management endpoints")
+        secret = new_totp_secret()
+        conn.execute("UPDATE users SET mfa_secret=? WHERE id=?", (secret, row["id"]))
+        conn.commit()
+        _clear_rate_limit(conn, body.email)
+        uri = f"otpauth://totp/UNG-TALOS:{row['email']}?secret={secret}&issuer=UNG-TALOS"
+        return {"secret": secret, "otpauth_uri": uri}
+    finally:
+        conn.close()
+
+
+class BootstrapMfaEnableIn(BaseModel):
+    email: str
+    password: str
+    totp_code: str
+
+
+@router.post("/mfa/bootstrap/enable")
+def bootstrap_mfa_enable(body: BootstrapMfaEnableIn):
+    conn = get_db()
+    try:
+        row = _password_authenticated_user(conn, body.email, body.password)
+        if row["role"] not in MFA_REQUIRED_ROLES:
+            raise HTTPException(status_code=400, detail="Bootstrap MFA enrollment is only for roles that require MFA")
+        if row["mfa_enabled"]:
+            raise HTTPException(status_code=409, detail="MFA is already enabled")
+        if not row["mfa_secret"]:
+            raise HTTPException(status_code=400, detail="Call /auth/mfa/bootstrap/setup first")
+        if not verify_totp(row["mfa_secret"], body.totp_code):
+            _record_failed_login(conn, body.email)
+            raise HTTPException(status_code=401, detail="Invalid code")
+        conn.execute("UPDATE users SET mfa_enabled=1 WHERE id=?", (row["id"],))
+        conn.commit()
+        codes = generate_backup_codes()
+        store_backup_codes(conn, row["id"], codes)
+        _clear_rate_limit(conn, body.email)
+        return {"mfa_enabled": True, "backup_codes": codes}
     finally:
         conn.close()
 
