@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from main import app
 from db import get_db, init_db
-from auth import bootstrap_admin_if_empty, new_totp_secret, totp_code
+from auth import bootstrap_admin_if_empty, totp_code
 import integrity
 
 client = TestClient(app)
@@ -36,6 +36,32 @@ def test_security_admin_login_requires_mfa():
         "password": "TestPass123!",
     })
     assert response.status_code == 403
+
+
+def test_bootstrap_security_admin_can_enroll_mfa_then_login():
+    setup_response = client.post("/auth/mfa/bootstrap/setup", json={
+        "email": "test-admin@ung-talos.local",
+        "password": "TestPass123!",
+    })
+    assert setup_response.status_code == 200
+    secret = setup_response.json()["secret"]
+
+    enable_response = client.post("/auth/mfa/bootstrap/enable", json={
+        "email": "test-admin@ung-talos.local",
+        "password": "TestPass123!",
+        "totp_code": totp_code(secret),
+    })
+    assert enable_response.status_code == 200
+    assert enable_response.json()["mfa_enabled"] is True
+    assert len(enable_response.json()["backup_codes"]) == 10
+
+    login_response = client.post("/auth/login", json={
+        "email": "test-admin@ung-talos.local",
+        "password": "TestPass123!",
+        "totp_code": totp_code(secret),
+    })
+    assert login_response.status_code == 200
+    assert login_response.json()["role"] == "security_admin"
 
 
 def test_integrity_chain_detects_tampering():
