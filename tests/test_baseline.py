@@ -13,6 +13,7 @@ from main import app
 from db import get_db, init_db
 from auth import bootstrap_admin_if_empty, totp_code
 import integrity
+import scheduler
 
 client = TestClient(app)
 
@@ -90,3 +91,14 @@ def test_integrity_chain_detects_tampering():
         assert result["ok"] is False
     finally:
         conn.close()
+
+
+def test_scheduler_leader_lock_allows_only_one_process(tmp_path):
+    lock_path = tmp_path / "scheduler.lock"
+    first = scheduler.acquire_leader_lock(str(lock_path))
+    assert first is not None
+    try:
+        second = scheduler.acquire_leader_lock(str(lock_path))
+        assert second is None
+    finally:
+        scheduler.release_leader_lock(first)
